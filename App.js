@@ -3,27 +3,23 @@ import { useEffect, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
+  Platform,
   Pressable,
   SafeAreaView,
+  ScrollView,
   StyleSheet,
   Text,
   TextInput,
   View,
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import DateTimePicker from '@react-native-community/datetimepicker';
 
-// URL de base de votre API backend.
 const URL_API_BASE = 'http://127.0.0.1:8000/api';
-
-// Cle utilisee pour sauvegarder la session utilisateur sur le telephone.
 const CLE_STOCKAGE_UTILISATEUR = '@gestionRDV_user';
+const URL_RACINE_BACKEND = URL_API_BASE.replace(/\/api\/?$/, '');
 
-// Harmonise le format des roles.
-// Selon le backend, `roles` peut arriver sous plusieurs formes:
-// - deja en tableau JavaScript: ['ROLE_PATIENT']
-// - en texte JSON: '["ROLE_PATIENT"]'
-// - en chaine simple: 'ROLE_PATIENT'
-// Le but est d'obtenir toujours un tableau pour simplifier les verifications.
+// Accepte roles sous forme tableau, JSON texte ou chaine simple.
 const normaliserRoles = (rolesBruts) => {
   if (Array.isArray(rolesBruts)) {
     return rolesBruts;
@@ -45,26 +41,19 @@ const normaliserRoles = (rolesBruts) => {
   return [];
 };
 
-// Si le backend renvoie surtout un JWT, on lit simplement son payload.
-// Un JWT a souvent la forme: header.payload.signature
-// Ici, on decode uniquement la partie `payload` pour lire des infos utiles
-// comme les roles, l'email ou l'identifiant utilisateur.
-// Cette lecture se fait uniquement cote client pour verifier l'acces a l'app.
+// Decode le payload du JWT (partie centrale).
 const lirePayloadJwt = (jeton) => {
   if (!jeton || typeof jeton !== 'string') {
     return {};
   }
 
   try {
-    // On recupere la partie centrale du JWT, qui contient les donnees utiles.
     const partiePayload = jeton.split('.')[1];
 
     if (!partiePayload) {
       return {};
     }
 
-    // Le payload JWT utilise souvent le format Base64 URL,
-    // on le convertit donc en Base64 classique avant decodage.
     const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=';
     const base64 = partiePayload.replace(/-/g, '+').replace(/_/g, '/');
     const base64Complete = `${base64}${'='.repeat((4 - (base64.length % 4 || 4)) % 4)}`;
@@ -72,7 +61,6 @@ const lirePayloadJwt = (jeton) => {
     let index = 0;
     let texteDecode = '';
 
-    // On reconstruit le texte JSON caractere par caractere.
     while (index < base64Complete.length) {
       const a = alphabet.indexOf(base64Complete.charAt(index++));
       const b = alphabet.indexOf(base64Complete.charAt(index++));
@@ -94,32 +82,16 @@ const lirePayloadJwt = (jeton) => {
       }
     }
 
-    // Si tout se passe bien, le payload contient un JSON exploitable.
     return JSON.parse(texteDecode);
   } catch (erreur) {
-    // En cas d'erreur, on retourne un objet vide pour eviter un crash.
     return {};
   }
 };
 
-// Cette fonction construit un objet utilisateur unique pour toute l'application.
-// Elle prend les informations soit depuis:
-// - la reponse JSON directe (`user`, `data.user`, etc.)
-// - le payload du JWT si certaines infos ne sont pas directement presentes
-// Cela permet au reste de l'app de toujours manipuler le meme format.
 const normaliserUtilisateur = (donnees, emailDeSecours) => {
-  // On cherche d'abord un jeton eventuellement renvoye par le backend.
   const jeton = donnees?.token || donnees?.jwt || donnees?.access_token || donnees?.data?.token || donnees?.data?.jwt || null;
-
-  // Si un JWT existe, on lit son payload pour recuperer roles, email, id, etc.
   const payloadJwt = lirePayloadJwt(jeton);
-
-  // Certaines API renvoient l'utilisateur dans `user`, d'autres dans `data.user`
-  // ou directement dans `data`. On couvre ici les cas les plus frequents.
   const contenu = donnees?.user || donnees?.data?.user || donnees?.data || {};
-
-  // On priorise les roles presents dans la reponse JSON,
-  // puis on tombe sur le JWT si necessaire.
   const roles = normaliserRoles(contenu?.roles || payloadJwt?.roles);
 
   return {
@@ -133,45 +105,263 @@ const normaliserUtilisateur = (donnees, emailDeSecours) => {
   };
 };
 
-// Regle metier principale de l'application.
-// On autorise l'acces seulement si le tableau de roles contient ROLE_PATIENT.
-// Un medecin, un assistant ou tout autre profil sera donc refuse.
+// Regle metier: acces reserve aux comptes ROLE_PATIENT.
 const estUtilisateurPatient = (utilisateur) => {
   const roles = normaliserRoles(utilisateur?.roles).map((role) => String(role).toUpperCase());
 
   return roles.includes('ROLE_PATIENT');
 };
 
-// Construit le nom visible dans l'interface.
-// On essaye d'afficher `nom prenom`; si l'un des deux manque,
-// on utilise l'email pour ne jamais laisser un titre vide.
+const extraireCollection = (donnees) => {
+  if (Array.isArray(donnees?.['hydra:member'])) {
+    return donnees['hydra:member'];
+  }
+
+  if (Array.isArray(donnees?.member)) {
+    return donnees.member;
+  }
+
+  if (Array.isArray(donnees)) {
+    return donnees;
+  }
+
+  return [];
+};
+
+const extraireListeCreneauxBruts = (donnees) => {
+  if (Array.isArray(donnees?.slots)) {
+    return donnees.slots;
+  }
+
+  if (Array.isArray(donnees?.availableSlots)) {
+    return donnees.availableSlots;
+  }
+
+  return extraireCollection(donnees);
+};
+
+const formatNomMedecin = (medecin) => {
+  const nom = medecin?.nom || '';
+  const prenom = medecin?.prenom || '';
+  const nomComplet = `${prenom} ${nom}`.trim();
+  return nomComplet || 'Medecin';
+};
+
+const parserIsoDate = (valeur, dateParDefautIso = obtenirDateDuJourIso()) => {
+  if (!valeur) {
+    return null;
+  }
+
+  const texte = String(valeur).trim();
+
+  if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/.test(texte)) {
+    return texte;
+  }
+
+  if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/.test(texte)) {
+    return `${texte}:00`;
+  }
+
+  if (/^\d{2}:\d{2}$/.test(texte)) {
+    return `${dateParDefautIso}T${texte}:00`;
+  }
+
+  return null;
+};
+
+const calculerFinCreneau = (debutIso) => {
+  const dateDebut = new Date(debutIso);
+
+  if (Number.isNaN(dateDebut.getTime())) {
+    return debutIso;
+  }
+
+  const dateFin = new Date(dateDebut.getTime() + 60 * 60 * 1000);
+  return dateFin.toISOString().slice(0, 19);
+};
+
+const formaterCreneauAffiche = (debutIso) => {
+  const date = new Date(debutIso);
+
+  if (Number.isNaN(date.getTime())) {
+    return debutIso;
+  }
+
+  const jour = String(date.getDate()).padStart(2, '0');
+  const mois = String(date.getMonth() + 1).padStart(2, '0');
+  const annee = date.getFullYear();
+  const heure = String(date.getHours()).padStart(2, '0');
+  const minute = String(date.getMinutes()).padStart(2, '0');
+
+  return `${jour}/${mois}/${annee} - ${heure}:${minute}`;
+};
+
+const obtenirDateDuJourIso = () => {
+  const dateDuJour = new Date();
+  const annee = dateDuJour.getFullYear();
+  const mois = String(dateDuJour.getMonth() + 1).padStart(2, '0');
+  const jour = String(dateDuJour.getDate()).padStart(2, '0');
+  return `${annee}-${mois}-${jour}`;
+};
+
+const obtenirDateIsoDepuisObjet = (dateObjet) => {
+  const annee = dateObjet.getFullYear();
+  const mois = String(dateObjet.getMonth() + 1).padStart(2, '0');
+  const jour = String(dateObjet.getDate()).padStart(2, '0');
+  return `${annee}-${mois}-${jour}`;
+};
+
+const formaterDateAffichee = (dateObjet) => {
+  const jour = String(dateObjet.getDate()).padStart(2, '0');
+  const mois = String(dateObjet.getMonth() + 1).padStart(2, '0');
+  const annee = dateObjet.getFullYear();
+  return `${jour}/${mois}/${annee}`;
+};
+
+const extraireIdDepuisIri = (valeur) => {
+  if (typeof valeur !== 'string') {
+    return null;
+  }
+
+  const correspondance = valeur.match(/\/(\d+)$/);
+  return correspondance ? correspondance[1] : null;
+};
+
+const formaterDateHeure = (valeur) => {
+  if (!valeur) {
+    return '-';
+  }
+
+  const date = new Date(valeur);
+
+  if (Number.isNaN(date.getTime())) {
+    return String(valeur);
+  }
+
+  const jour = String(date.getDate()).padStart(2, '0');
+  const mois = String(date.getMonth() + 1).padStart(2, '0');
+  const annee = date.getFullYear();
+  const heure = String(date.getHours()).padStart(2, '0');
+  const minute = String(date.getMinutes()).padStart(2, '0');
+
+  return `${jour}/${mois}/${annee} ${heure}:${minute}`;
+};
+
+const normaliserTexte = (valeur) =>
+  String(valeur || '')
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '');
+
+const obtenirLibelleMedecin = (medecinValeur, medecinsParIri = {}) => {
+  if (typeof medecinValeur === 'string' && medecinsParIri[medecinValeur]) {
+    return medecinsParIri[medecinValeur];
+  }
+
+  if (medecinValeur && typeof medecinValeur === 'object') {
+    const nomComplet = `${medecinValeur?.prenom || ''} ${medecinValeur?.nom || ''}`.trim();
+    if (nomComplet) {
+      return nomComplet;
+    }
+  }
+
+  const idIri = extraireIdDepuisIri(medecinValeur);
+  if (idIri) {
+    return `Medecin #${idIri}`;
+  }
+
+  return 'Medecin';
+};
+
+const obtenirLibelleEtat = (etatValeur, etatsParIri = {}) => {
+  if (typeof etatValeur === 'string' && etatsParIri[etatValeur]) {
+    return etatsParIri[etatValeur];
+  }
+
+  if (etatValeur && typeof etatValeur === 'object' && etatValeur?.libelle) {
+    return etatValeur.libelle;
+  }
+
+  const idIri = extraireIdDepuisIri(etatValeur);
+  if (idIri) {
+    return `Etat #${idIri}`;
+  }
+
+  return 'Non defini';
+};
+
+const obtenirPrioriteEtat = (etatLibelle) => {
+  const etatNormalise = normaliserTexte(etatLibelle);
+
+  if (etatNormalise.includes('demande') || etatNormalise.includes('attente')) {
+    return 1;
+  }
+
+  if (etatNormalise.includes('confirme')) {
+    return 2;
+  }
+
+  if (etatNormalise.includes('realise')) {
+    return 3;
+  }
+
+  if (etatNormalise.includes('annule')) {
+    return 4;
+  }
+
+  if (etatNormalise.includes('refuse')) {
+    return 5;
+  }
+
+  return 99;
+};
+
+const extraireCommentaireRdv = (rdv) => {
+  const commentaireBrut =
+    rdv?.commentaire ||
+    rdv?.comment ||
+    rdv?.directive ||
+    rdv?.directives ||
+    rdv?.consigne ||
+    rdv?.consignes ||
+    rdv?.note ||
+    rdv?.notes ||
+    '';
+
+  return String(commentaireBrut || '').trim();
+};
+
 const obtenirNomAffiche = (utilisateur) => {
   const nomComplet = `${utilisateur?.nom || ''} ${utilisateur?.prenom || ''}`.trim();
   return nomComplet || utilisateur?.email || 'Utilisateur';
 };
 
 export default function App() {
-  // Champs saisis par l'utilisateur dans le formulaire de connexion.
   const [courriel, setCourriel] = useState('');
   const [motDePasse, setMotDePasse] = useState('');
-
-  // Petit systeme de navigation local a ce composant.
-  // `loading`  : l'app verifie s'il existe deja une session
-  // `accueil`  : ecran d'introduction
-  // `login`    : formulaire de connexion
-  // `menu`     : ecran principal du patient connecte
   const [ecran, setEcran] = useState('loading');
-
-  // Cet etat evite les doubles clics pendant l'appel au backend.
   const [connexionEnCours, setConnexionEnCours] = useState(false);
-
-  // Contient le profil du patient une fois la connexion validee.
   const [utilisateurConnecte, setUtilisateurConnecte] = useState(null);
 
+  const [medecinsDisponibles, setMedecinsDisponibles] = useState([]);
+  const [medecinSelectionne, setMedecinSelectionne] = useState(null);
+  const [chargementMedecins, setChargementMedecins] = useState(false);
+  const [erreurChargementMedecins, setErreurChargementMedecins] = useState('');
+  const [dateSelectionnee, setDateSelectionnee] = useState(new Date());
+  const [afficherCalendrier, setAfficherCalendrier] = useState(false);
+  const [creneauxDisponibles, setCreneauxDisponibles] = useState([]);
+  const [chargementPriseRdv, setChargementPriseRdv] = useState(false);
+  const [chargementCreneaux, setChargementCreneaux] = useState(false);
+  const [creationRdvEnCours, setCreationRdvEnCours] = useState(false);
+  const [mesRendezVous, setMesRendezVous] = useState([]);
+  const [chargementMesRdv, setChargementMesRdv] = useState(false);
+  const [erreurMesRdv, setErreurMesRdv] = useState('');
+  const [rdvSelectionne, setRdvSelectionne] = useState(null);
+  const [annulationRdvId, setAnnulationRdvId] = useState(null);
+  const [patientIri, setPatientIri] = useState('');
+  const [etatEnAttenteIri, setEtatEnAttenteIri] = useState('/api/etats/1');
+
   useEffect(() => {
-    // Au demarrage, on essaie de restaurer la session locale.
-    // Si un utilisateur valide est deja stocke dans AsyncStorage,
-    // on le renvoie directement vers le menu sans repasser par le login.
     const restaurerSession = async () => {
       try {
         const utilisateurSauvegarde = await AsyncStorage.getItem(CLE_STOCKAGE_UTILISATEUR);
@@ -179,32 +369,36 @@ export default function App() {
         if (utilisateurSauvegarde) {
           const utilisateurParse = JSON.parse(utilisateurSauvegarde);
 
-          // Par securite, on reverifie le role avant de rouvrir la session.
           if (estUtilisateurPatient(utilisateurParse)) {
             setUtilisateurConnecte(utilisateurParse);
             setEcran('menu');
             return;
           }
 
-          // Si le stockage contient un utilisateur non autorise,
-          // on supprime la session locale pour repartir proprement.
           await AsyncStorage.removeItem(CLE_STOCKAGE_UTILISATEUR);
         }
       } catch (erreur) {
         console.error('Erreur restauration session:', erreur);
       }
 
-      // Si aucune session exploitable n'existe, on affiche l'accueil.
       setEcran('accueil');
     };
 
     restaurerSession();
   }, []);
 
-  // Cette fonction lit la reponse HTTP de maniere defensive.
-  // Pourquoi ne pas faire directement `response.json()` ?
-  // Parce que si le backend renvoie une reponse vide ou invalide,
-  // `response.json()` peut lever une erreur. Ici on garde le controle.
+  useEffect(() => {
+    if (ecran === 'prise_rdv' && utilisateurConnecte?.jeton) {
+      initialiserPriseRdv();
+    }
+  }, [ecran, utilisateurConnecte?.jeton]);
+
+  useEffect(() => {
+    if (ecran === 'mes_rdv' && utilisateurConnecte?.jeton) {
+      chargerMesRendezVous();
+    }
+  }, [ecran, utilisateurConnecte?.jeton]);
+
   const parserDonneesReponse = async (reponse) => {
     const texteBrut = await reponse.text();
 
@@ -215,18 +409,487 @@ export default function App() {
     try {
       return JSON.parse(texteBrut);
     } catch (erreur) {
-      // On renvoie un message standard pour pouvoir afficher une alerte propre.
       return { message: 'Réponse serveur invalide' };
     }
   };
 
-  // Fonction principale de connexion.
-  // Etapes:
-  // 1. verifier que les champs sont remplis
-  // 2. appeler l'API `/login`
-  // 3. reconstruire l'utilisateur a partir de la reponse/JWT
-  // 4. verifier le role ROLE_PATIENT
-  // 5. sauvegarder la session locale puis ouvrir le menu
+  const obtenirHeadersAuth = (contentType = null) => {
+    const headers = {
+      Accept: 'application/ld+json',
+      Authorization: `Bearer ${utilisateurConnecte?.jeton || ''}`,
+    };
+
+    if (contentType) {
+      headers['Content-Type'] = contentType;
+    }
+
+    return headers;
+  };
+
+  const recupererMedecins = async () => {
+    setChargementMedecins(true);
+    setErreurChargementMedecins('');
+
+    try {
+      const reponse = await fetch(`${URL_API_BASE}/medecins`, {
+        headers: obtenirHeadersAuth(),
+      });
+
+      const donnees = await parserDonneesReponse(reponse);
+
+      if (!reponse.ok) {
+        setMedecinsDisponibles([]);
+        setErreurChargementMedecins(donnees?.detail || donnees?.message || 'Impossible de charger la liste des medecins.');
+        return;
+      }
+
+      const medecins = extraireCollection(donnees)
+        .map((medecin) => ({
+          id: medecin?.id,
+          iri: medecin?.['@id'] || `/api/medecins/${medecin?.id}`,
+          nomAffiche: formatNomMedecin(medecin),
+        }))
+        .filter((medecin) => medecin?.id && medecin?.iri);
+
+      setMedecinsDisponibles(medecins);
+      setMedecinSelectionne((precedent) => {
+        if (!medecins.length) {
+          return null;
+        }
+
+        if (precedent?.id && medecins.some((medecin) => medecin.id === precedent.id)) {
+          return precedent;
+        }
+
+        return medecins[0];
+      });
+    } catch (erreur) {
+      setMedecinsDisponibles([]);
+      setErreurChargementMedecins('Impossible de recuperer les medecins. Verifiez la connexion avec le backend.');
+      console.error('Erreur recupererMedecins:', erreur);
+    } finally {
+      setChargementMedecins(false);
+    }
+  };
+
+  const initialiserPriseRdv = async () => {
+    setChargementPriseRdv(true);
+
+    try {
+      await recupererMedecins();
+
+      const [reponsePatients, reponseEtats] = await Promise.all([
+        fetch(`${URL_API_BASE}/patients`, {
+          headers: obtenirHeadersAuth(),
+        }),
+        fetch(`${URL_API_BASE}/etats`, {
+          headers: obtenirHeadersAuth(),
+        }),
+      ]);
+
+      const [donneesPatients, donneesEtats] = await Promise.all([
+        parserDonneesReponse(reponsePatients),
+        parserDonneesReponse(reponseEtats),
+      ]);
+
+      if (reponsePatients.ok) {
+        const patients = extraireCollection(donneesPatients);
+        const patientCourant = patients.find(
+          (patient) => String(patient?.email || '').toLowerCase() === String(utilisateurConnecte?.email || '').toLowerCase()
+        );
+
+        if (patientCourant) {
+          setPatientIri(patientCourant?.['@id'] || `/api/patients/${patientCourant?.id}`);
+        } else if (utilisateurConnecte?.id) {
+          setPatientIri(`/api/patients/${utilisateurConnecte.id}`);
+        }
+      }
+
+      if (reponseEtats.ok) {
+        const etats = extraireCollection(donneesEtats);
+        const etatEnAttente = etats.find((etat) => String(etat?.libelle || '').toLowerCase().includes('attente'));
+
+        if (etatEnAttente) {
+          setEtatEnAttenteIri(etatEnAttente?.['@id'] || `/api/etats/${etatEnAttente?.id}`);
+        }
+      }
+    } catch (erreur) {
+      Alert.alert('Erreur', 'Initialisation de la prise de RDV impossible.');
+      console.error('Erreur initialiserPriseRdv:', erreur);
+    } finally {
+      setChargementPriseRdv(false);
+    }
+  };
+
+  const trouverPatientIri = async () => {
+    if (patientIri) {
+      return patientIri;
+    }
+
+    if (utilisateurConnecte?.id) {
+      const iriParId = `/api/patients/${utilisateurConnecte.id}`;
+      setPatientIri(iriParId);
+      return iriParId;
+    }
+
+    const reponsePatients = await fetch(`${URL_API_BASE}/patients`, {
+      headers: obtenirHeadersAuth(),
+    });
+
+    const donneesPatients = await parserDonneesReponse(reponsePatients);
+
+    if (!reponsePatients.ok) {
+      return '';
+    }
+
+    const patients = extraireCollection(donneesPatients);
+    const patientCourant = patients.find(
+      (patient) => String(patient?.email || '').toLowerCase() === String(utilisateurConnecte?.email || '').toLowerCase()
+    );
+
+    const iri = patientCourant?.['@id'] || (patientCourant?.id ? `/api/patients/${patientCourant.id}` : '');
+
+    if (iri) {
+      setPatientIri(iri);
+    }
+
+    return iri;
+  };
+
+  const chargerMesRendezVous = async () => {
+    setChargementMesRdv(true);
+    setErreurMesRdv('');
+
+    try {
+      const iriPatient = await trouverPatientIri();
+
+      if (!iriPatient) {
+        setMesRendezVous([]);
+        setErreurMesRdv('Profil patient introuvable. Reconnectez-vous.');
+        return;
+      }
+
+      const [reponse, reponseMedecins, reponseEtats] = await Promise.all([
+        fetch(`${URL_API_BASE}/rendez_vouses?patient=${encodeURIComponent(iriPatient)}&order[debut]=desc`, {
+          headers: obtenirHeadersAuth(),
+        }),
+        fetch(`${URL_API_BASE}/medecins`, {
+          headers: obtenirHeadersAuth(),
+        }),
+        fetch(`${URL_API_BASE}/etats`, {
+          headers: obtenirHeadersAuth(),
+        }),
+      ]);
+
+      const [donnees, donneesMedecins, donneesEtats] = await Promise.all([
+        parserDonneesReponse(reponse),
+        parserDonneesReponse(reponseMedecins),
+        parserDonneesReponse(reponseEtats),
+      ]);
+
+      if (!reponse.ok) {
+        setMesRendezVous([]);
+        setErreurMesRdv(donnees?.detail || donnees?.message || 'Impossible de charger vos rendez-vous.');
+        return;
+      }
+
+      const medecinsParIri = {};
+      if (reponseMedecins.ok) {
+        extraireCollection(donneesMedecins).forEach((medecin) => {
+          const iri = medecin?.['@id'] || (medecin?.id ? `/api/medecins/${medecin.id}` : '');
+          if (iri) {
+            medecinsParIri[iri] = formatNomMedecin(medecin);
+          }
+        });
+      }
+
+      const etatsParIri = {};
+      if (reponseEtats.ok) {
+        extraireCollection(donneesEtats).forEach((etat) => {
+          const iri = etat?.['@id'] || (etat?.id ? `/api/etats/${etat.id}` : '');
+          if (iri) {
+            etatsParIri[iri] = etat?.libelle || `Etat #${etat?.id}`;
+          }
+        });
+      }
+
+      const rendezVous = extraireCollection(donnees).map((rdv) => ({
+        id: rdv?.id,
+        iri: rdv?.['@id'] || (rdv?.id ? `/api/rendez_vouses/${rdv.id}` : ''),
+        debut: rdv?.debut,
+        fin: rdv?.fin,
+        medecin: rdv?.medecin,
+        etat: rdv?.etat,
+        medecinLibelle: obtenirLibelleMedecin(rdv?.medecin, medecinsParIri),
+        etatLibelle: obtenirLibelleEtat(rdv?.etat, etatsParIri),
+        commentaire: extraireCommentaireRdv(rdv),
+      }));
+
+      rendezVous.sort((a, b) => {
+        const prioriteA = obtenirPrioriteEtat(a.etatLibelle);
+        const prioriteB = obtenirPrioriteEtat(b.etatLibelle);
+
+        if (prioriteA !== prioriteB) {
+          return prioriteA - prioriteB;
+        }
+
+        return new Date(b.debut || 0).getTime() - new Date(a.debut || 0).getTime();
+      });
+
+      setMesRendezVous(rendezVous);
+    } catch (erreur) {
+      setMesRendezVous([]);
+      setErreurMesRdv('Impossible de charger vos rendez-vous.');
+      console.error('Erreur chargerMesRendezVous:', erreur);
+    } finally {
+      setChargementMesRdv(false);
+    }
+  };
+
+  const estEtatAnnulable = (etatLibelle) => {
+    const etatNormalise = normaliserTexte(etatLibelle);
+    return !(etatNormalise.includes('annule') || etatNormalise.includes('refuse') || etatNormalise.includes('realise'));
+  };
+
+  const annulerRendezVous = async (rdv) => {
+    if (!rdv?.id) {
+      Alert.alert('Erreur', 'Rendez-vous invalide.');
+      return;
+    }
+
+    if (!estEtatAnnulable(rdv?.etatLibelle || obtenirLibelleEtat(rdv?.etat))) {
+      Alert.alert('Information', 'Ce rendez-vous ne peut plus etre annule.');
+      return;
+    }
+
+    setAnnulationRdvId(rdv.id);
+
+    try {
+      const reponseEtats = await fetch(`${URL_API_BASE}/etats`, {
+        headers: obtenirHeadersAuth(),
+      });
+
+      const donneesEtats = await parserDonneesReponse(reponseEtats);
+
+      if (!reponseEtats.ok) {
+        Alert.alert('Erreur', 'Impossible de charger les etats.');
+        return;
+      }
+
+      const etatAnnule = extraireCollection(donneesEtats).find(
+        (etat) => normaliserTexte(etat?.libelle).includes('annule')
+      );
+
+      const iriEtatAnnule = etatAnnule?.['@id'] || (etatAnnule?.id ? `/api/etats/${etatAnnule.id}` : '');
+
+      if (!iriEtatAnnule) {
+        Alert.alert('Erreur', 'Etat annule introuvable.');
+        return;
+      }
+
+      const iriRdv = rdv?.iri || `/api/rendez_vouses/${rdv.id}`;
+
+      const reponse = await fetch(`${URL_API_BASE}/rendez_vouses/${rdv.id}`, {
+        method: 'PATCH',
+        headers: {
+          ...obtenirHeadersAuth('application/merge-patch+json'),
+          Accept: 'application/ld+json',
+        },
+        body: JSON.stringify({
+          etat: iriEtatAnnule,
+        }),
+      });
+
+      const donnees = await parserDonneesReponse(reponse);
+
+      if (!reponse.ok) {
+        Alert.alert('Erreur', donnees?.detail || donnees?.message || 'Annulation impossible.');
+        return;
+      }
+
+      setMesRendezVous((precedent) =>
+        precedent.map((item) =>
+          item.id === rdv.id
+            ? {
+                ...item,
+                etat: iriEtatAnnule,
+                etatLibelle: etatAnnule?.libelle || 'annule',
+                iri: item?.iri || iriRdv,
+              }
+            : item
+        )
+      );
+
+      Alert.alert('Succes', 'Le rendez-vous a bien ete annule.');
+      await chargerMesRendezVous();
+    } catch (erreur) {
+      Alert.alert('Erreur', 'Impossible d\'annuler ce rendez-vous.');
+      console.error('Erreur annulerRendezVous:', erreur);
+    } finally {
+      setAnnulationRdvId(null);
+    }
+  };
+
+  const chargerCreneauxDisponibles = async () => {
+    if (!medecinSelectionne?.id) {
+      Alert.alert('Erreur', 'Veuillez selectionner un medecin.');
+      return;
+    }
+
+    setChargementCreneaux(true);
+
+    try {
+      const dateRecherche = obtenirDateIsoDepuisObjet(dateSelectionnee);
+
+      const endpointsDisponibilites = [
+        `${URL_RACINE_BACKEND}/medecin/${medecinSelectionne.id}/available-slots?date=${encodeURIComponent(dateRecherche)}`,
+        `${URL_API_BASE}/medecin/${medecinSelectionne.id}/available-slots?date=${encodeURIComponent(dateRecherche)}`,
+      ];
+
+      let reponse = null;
+      let donnees = {};
+
+      for (const endpoint of endpointsDisponibilites) {
+        const tentative = await fetch(endpoint, {
+          headers: obtenirHeadersAuth(),
+        });
+
+        const donneesTentative = await parserDonneesReponse(tentative);
+
+        if (tentative.ok) {
+          reponse = tentative;
+          donnees = donneesTentative;
+          break;
+        }
+
+        if (!reponse || tentative.status !== 404) {
+          reponse = tentative;
+          donnees = donneesTentative;
+        }
+      }
+
+      if (!reponse.ok) {
+        const detailsErreursValidation = Array.isArray(donnees?.violations)
+          ? donnees.violations.map((item) => item?.message).filter(Boolean).join('\n')
+          : '';
+
+        const messageErreur =
+          donnees?.error ||
+          donnees?.detail ||
+          donnees?.message ||
+          detailsErreursValidation ||
+          `Impossible de charger les creneaux (HTTP ${reponse.status}).`;
+
+        Alert.alert('Erreur', messageErreur);
+        return;
+      }
+
+      const creneaux = extraireListeCreneauxBruts(donnees)
+        .map((item, index) => {
+          if (typeof item === 'string') {
+            const debutIsoTexte = parserIsoDate(item, dateRecherche);
+
+            if (!debutIsoTexte) {
+              return null;
+            }
+
+            return {
+              id: `${item}-${index}`,
+              debut: debutIsoTexte,
+              fin: calculerFinCreneau(debutIsoTexte),
+              label: formaterCreneauAffiche(debutIsoTexte),
+            };
+          }
+
+          const disponible = item?.available ?? true;
+
+          if (!disponible) {
+            return null;
+          }
+
+          const debutIso = parserIsoDate(item?.start || item?.debut || item?.value || item?.label, dateRecherche);
+          const finIso = parserIsoDate(item?.end || item?.fin, dateRecherche) || (debutIso ? calculerFinCreneau(debutIso) : null);
+
+          if (!debutIso || !finIso) {
+            return null;
+          }
+
+          return {
+            id: String(item?.id || item?.value || index),
+            debut: debutIso,
+            fin: finIso,
+            label: formaterCreneauAffiche(debutIso),
+          };
+        })
+        .filter(Boolean);
+
+      setCreneauxDisponibles(creneaux);
+
+      if (creneaux.length === 0) {
+        Alert.alert('Information', `Aucun creneau disponible le ${formaterDateAffichee(dateSelectionnee)}.`);
+      }
+    } catch (erreur) {
+      Alert.alert('Erreur', 'Impossible de recuperer les creneaux.');
+      console.error('Erreur chargerCreneauxDisponibles:', erreur);
+    } finally {
+      setChargementCreneaux(false);
+    }
+  };
+
+  const creerRendezVous = async (creneau) => {
+    const patientIriCourant = patientIri || (utilisateurConnecte?.id ? `/api/patients/${utilisateurConnecte.id}` : '');
+
+    if (!patientIriCourant) {
+      Alert.alert('Erreur', 'Profil patient introuvable. Reconnectez-vous.');
+      return;
+    }
+
+    if (!medecinSelectionne?.iri) {
+      Alert.alert('Erreur', 'Medecin non selectionne.');
+      return;
+    }
+
+    setCreationRdvEnCours(true);
+
+    try {
+      const debut = creneau?.debut;
+      const fin = creneau?.fin;
+
+      if (!debut || !fin) {
+        Alert.alert('Erreur', 'Creneau invalide. Rechargez les disponibilites.');
+        return;
+      }
+
+      const reponse = await fetch(`${URL_API_BASE}/rendez_vouses`, {
+        method: 'POST',
+        headers: obtenirHeadersAuth('application/ld+json'),
+        body: JSON.stringify({
+          patient: patientIriCourant,
+          medecin: medecinSelectionne.iri,
+          debut,
+          fin,
+          etat: etatEnAttenteIri,
+        }),
+      });
+
+      const donnees = await parserDonneesReponse(reponse);
+
+      if (reponse.ok || reponse.status === 201) {
+        Alert.alert('Succes', 'Votre demande de rendez-vous a bien ete envoyee.');
+        setCreneauxDisponibles([]);
+        setEcran('menu');
+        return;
+      }
+
+      Alert.alert('Erreur', donnees?.detail || donnees?.message || 'Creation du rendez-vous impossible.');
+    } catch (erreur) {
+      Alert.alert('Erreur', 'Erreur reseau lors de la creation du rendez-vous.');
+      console.error('Erreur creerRendezVous:', erreur);
+    } finally {
+      setCreationRdvEnCours(false);
+    }
+  };
+
   const validerConnexion = async () => {
     if (!courriel || !motDePasse) {
       Alert.alert('Erreur', 'Veuillez remplir tous les champs');
@@ -236,7 +899,6 @@ export default function App() {
     setConnexionEnCours(true);
 
     try {
-      // Appel du backend avec les identifiants saisis par l'utilisateur.
       const reponse = await fetch(`${URL_API_BASE}/login`, {
         method: 'POST',
         headers: {
@@ -248,22 +910,17 @@ export default function App() {
         }),
       });
 
-      // On parse la reponse pour en extraire les donnees utiles.
       const donnees = await parserDonneesReponse(reponse);
 
       if (reponse.ok) {
-        // On harmonise les infos utilisateur pour les utiliser dans toute l'app.
         const utilisateurNormalise = normaliserUtilisateur(donnees, courriel);
 
-        // Si on ne trouve aucun role, on ne peut pas appliquer la regle metier.
-        // On prefere donc bloquer proprement avec un message explicite.
         if (utilisateurNormalise.roles.length === 0) {
           Alert.alert('Erreur', 'Impossible de verifier le role depuis le JWT.');
           setMotDePasse('');
           return;
         }
 
-        // Le compte existe mais n'est pas un patient autorise dans cette application.
         if (!estUtilisateurPatient(utilisateurNormalise)) {
           Alert.alert('Acces refuse', 'Cette application est reservee aux patients.');
           setMotDePasse('');
@@ -271,49 +928,76 @@ export default function App() {
           return;
         }
 
-        // On sauvegarde la session pour eviter de redemander le login a chaque ouverture.
         await AsyncStorage.setItem(CLE_STOCKAGE_UTILISATEUR, JSON.stringify(utilisateurNormalise));
 
-        // Mise a jour de l'etat React puis navigation vers le menu patient.
         setUtilisateurConnecte(utilisateurNormalise);
         setMotDePasse('');
         setEcran('menu');
       } else {
-        // Ici on gere le cas classique: email ou mot de passe incorrect.
         Alert.alert('Erreur', donnees.message || 'Email ou mot de passe incorrect');
       }
     } catch (erreur) {
-      // Erreur reseau, serveur indisponible, CORS, etc.
       Alert.alert('Erreur', 'Impossible de se connecter au serveur');
       console.error('Erreur:', erreur);
     } finally {
-      // Quoi qu'il arrive, on reactive le bouton de connexion.
       setConnexionEnCours(false);
     }
   };
 
-  // Deconnexion locale.
-  // On efface la session stockee sur l'appareil puis on remet l'interface a zero.
   const seDeconnecter = async () => {
     try {
       await AsyncStorage.removeItem(CLE_STOCKAGE_UTILISATEUR);
       setUtilisateurConnecte(null);
       setCourriel('');
       setMotDePasse('');
+      setDateSelectionnee(new Date());
+      setAfficherCalendrier(false);
+      setCreneauxDisponibles([]);
+      setMesRendezVous([]);
+      setErreurMesRdv('');
+      setRdvSelectionne(null);
+      setAnnulationRdvId(null);
+      setMedecinsDisponibles([]);
+      setMedecinSelectionne(null);
+      setErreurChargementMedecins('');
+      setPatientIri('');
+      setEtatEnAttenteIri('/api/etats/1');
       setEcran('accueil');
     } catch (erreur) {
       Alert.alert('Erreur', 'Impossible de fermer la session');
     }
   };
 
-  // Pour l'instant, chaque bouton du menu ouvre juste une alerte.
-  // Plus tard, cette fonction pourra etre remplacee par de la vraie navigation.
   const gererActionMenu = (libelle) => {
+    if (libelle === 'Prendre un RDV') {
+      setEcran('prise_rdv');
+      return;
+    }
+
+    if (libelle === 'Mes RDV') {
+      setEcran('mes_rdv');
+      return;
+    }
+
     Alert.alert(libelle, 'Fonctionnalite patient prete a connecter.');
   };
 
-  // Ecran d'accueil avant connexion.
-  // Il presente l'application et redirige vers le formulaire de login.
+  const ouvrirDetailRdv = (rdv) => {
+    setRdvSelectionne(rdv);
+    setEcran('detail_rdv');
+  };
+
+  const gererChangementDate = (evenement, nouvelleDate) => {
+    if (Platform.OS === 'android') {
+      setAfficherCalendrier(false);
+    }
+
+    if (evenement?.type === 'set' && nouvelleDate) {
+      setDateSelectionnee(nouvelleDate);
+      setCreneauxDisponibles([]);
+    }
+  };
+
   const afficherAccueil = () => (
     <View style={styles.card}>
       <Text style={styles.badge}>Espace patient</Text>
@@ -328,8 +1012,6 @@ export default function App() {
     </View>
   );
 
-  // Formulaire de connexion du patient.
-  // Les champs sont lies a l'etat React, donc chaque saisie met a jour l'interface.
   const afficherConnexion = () => (
     <View style={styles.card}>
       <Pressable onPress={() => setEcran('accueil')}>
@@ -368,8 +1050,6 @@ export default function App() {
     </View>
   );
 
-  // Menu principal visible uniquement apres une connexion valide.
-  // Le nom affiche provient du profil normalise stocke dans l'etat.
   const afficherMenu = () => (
     <View style={styles.card}>
       <Text style={styles.badge}>Espace patient</Text>
@@ -386,10 +1066,6 @@ export default function App() {
           <Text style={styles.menuButtonText}>Mes RDV</Text>
         </Pressable>
 
-        <Pressable style={({ pressed }) => [styles.menuButton, pressed && styles.menuButtonPressed]} onPress={() => gererActionMenu('Annuler un RDV')}>
-          <Text style={styles.menuButtonText}>Annuler un RDV</Text>
-        </Pressable>
-
         <Pressable style={({ pressed }) => [styles.menuButton, pressed && styles.menuButtonPressed]} onPress={() => gererActionMenu('Mon profil')}>
           <Text style={styles.menuButtonText}>Mon profil</Text>
         </Pressable>
@@ -401,15 +1077,206 @@ export default function App() {
     </View>
   );
 
+  const afficherPriseRdv = () => (
+    <View style={styles.card}>
+      <Pressable onPress={() => setEcran('menu')}>
+        <Text style={styles.backLink}>Retour au menu</Text>
+      </Pressable>
+
+      <Text style={styles.title}>Prendre un RDV</Text>
+      <Text style={styles.subtitle}>Choisissez une date, un medecin puis un creneau disponible.</Text>
+
+      {chargementPriseRdv ? (
+        <ActivityIndicator size="small" color="#1454F0" style={styles.inlineLoader} />
+      ) : (
+        <>
+          <Text style={styles.fieldLabel}>Date du rendez-vous</Text>
+          <Pressable
+            style={({ pressed }) => [styles.datePickerButton, pressed && styles.buttonPressed]}
+            onPress={() => setAfficherCalendrier((precedent) => !precedent)}
+          >
+            <Text style={styles.datePickerButtonText}>{formaterDateAffichee(dateSelectionnee)}</Text>
+          </Pressable>
+
+          {afficherCalendrier && (
+            <View style={styles.calendrierContainer}>
+              <DateTimePicker
+                value={dateSelectionnee}
+                mode="date"
+                display={Platform.OS === 'ios' ? 'inline' : 'default'}
+                minimumDate={new Date()}
+                onChange={gererChangementDate}
+              />
+
+              {Platform.OS === 'ios' && (
+                <Pressable style={({ pressed }) => [styles.secondaryButton, pressed && styles.buttonPressed]} onPress={() => setAfficherCalendrier(false)}>
+                  <Text style={styles.secondaryButtonText}>Fermer le calendrier</Text>
+                </Pressable>
+              )}
+            </View>
+          )}
+
+          <Text style={styles.fieldLabel}>Medecin</Text>
+          <View style={styles.listeMedecins}>
+            {chargementMedecins ? (
+              <ActivityIndicator size="small" color="#1454F0" style={styles.inlineLoader} />
+            ) : medecinsDisponibles.length === 0 ? (
+              <>
+                <Text style={styles.infoText}>Aucun medecin disponible.</Text>
+                {!!erreurChargementMedecins && <Text style={styles.errorText}>{erreurChargementMedecins}</Text>}
+                <Pressable style={({ pressed }) => [styles.secondaryButton, pressed && styles.buttonPressed]} onPress={recupererMedecins}>
+                  <Text style={styles.secondaryButtonText}>Reessayer</Text>
+                </Pressable>
+              </>
+            ) : (
+              medecinsDisponibles.map((medecin) => {
+                const estSelectionne = medecinSelectionne?.id === medecin.id;
+
+                return (
+                  <Pressable
+                    key={String(medecin.id)}
+                    style={({ pressed }) => [
+                      styles.medecinButton,
+                      estSelectionne && styles.medecinButtonSelectionne,
+                      pressed && styles.buttonPressed,
+                    ]}
+                    onPress={() => {
+                      setMedecinSelectionne(medecin);
+                      setCreneauxDisponibles([]);
+                    }}
+                  >
+                    <Text style={[styles.medecinButtonText, estSelectionne && styles.medecinButtonTextSelectionne]}>
+                      {medecin.nomAffiche}
+                    </Text>
+                  </Pressable>
+                );
+              })
+            )}
+          </View>
+
+          <Pressable
+            style={({ pressed }) => [styles.primaryButton, (pressed || chargementCreneaux) && styles.buttonPressed]}
+            onPress={chargerCreneauxDisponibles}
+            disabled={chargementCreneaux || creationRdvEnCours || chargementMedecins || medecinsDisponibles.length === 0}
+          >
+            <Text style={styles.primaryButtonText}>{chargementCreneaux ? 'Chargement...' : 'Voir les disponibilites'}</Text>
+          </Pressable>
+
+          {creneauxDisponibles.length > 0 && (
+            <>
+              <Text style={styles.fieldLabel}>Creneaux disponibles</Text>
+              <View style={styles.menuGrid}>
+                {creneauxDisponibles.map((creneau) => (
+                  <Pressable
+                    key={creneau.id}
+                    style={({ pressed }) => [styles.menuButton, pressed && styles.menuButtonPressed]}
+                    onPress={() => creerRendezVous(creneau)}
+                    disabled={creationRdvEnCours}
+                  >
+                    <Text style={styles.menuButtonText}>{creationRdvEnCours ? 'Envoi...' : creneau.label}</Text>
+                  </Pressable>
+                ))}
+              </View>
+            </>
+          )}
+        </>
+      )}
+    </View>
+  );
+
+  const afficherMesRdv = () => (
+    <View style={styles.card}>
+      <Pressable onPress={() => setEcran('menu')}>
+        <Text style={styles.backLink}>Retour au menu</Text>
+      </Pressable>
+
+      <Text style={styles.title}>Mes RDV</Text>
+      <Text style={styles.subtitle}>Retrouvez la liste de vos rendez-vous planifies.</Text>
+
+      {chargementMesRdv ? (
+        <ActivityIndicator size="small" color="#1454F0" style={styles.inlineLoader} />
+      ) : (
+        <>
+          {!!erreurMesRdv && <Text style={styles.errorText}>{erreurMesRdv}</Text>}
+
+          {!erreurMesRdv && mesRendezVous.length === 0 && <Text style={styles.infoText}>Aucun rendez-vous trouve.</Text>}
+
+          {mesRendezVous.length > 0 && (
+            <ScrollView style={styles.rdvListe} contentContainerStyle={styles.rdvListeContenu}>
+              {mesRendezVous.map((rdv) => (
+                <View key={String(rdv.id || `${rdv.debut}-${rdv.fin}`)} style={styles.rdvCard}>
+                  <Text style={styles.rdvDate}>{formaterDateHeure(rdv.debut)}</Text>
+                  <Text style={styles.rdvMeta}>Fin : {formaterDateHeure(rdv.fin)}</Text>
+                  <Text style={styles.rdvMeta}>Medecin : {rdv.medecinLibelle || obtenirLibelleMedecin(rdv.medecin)}</Text>
+                  <Text style={styles.rdvMeta}>Etat : {rdv.etatLibelle || obtenirLibelleEtat(rdv.etat)}</Text>
+
+                  <Pressable style={({ pressed }) => [styles.secondaryButton, pressed && styles.buttonPressed]} onPress={() => ouvrirDetailRdv(rdv)}>
+                    <Text style={styles.secondaryButtonText}>Afficher le RDV</Text>
+                  </Pressable>
+
+                  {estEtatAnnulable(rdv.etatLibelle || obtenirLibelleEtat(rdv.etat)) && (
+                    <Pressable
+                      style={({ pressed }) => [styles.annulerButton, (pressed || annulationRdvId === rdv.id) && styles.buttonPressed]}
+                      onPress={() => annulerRendezVous(rdv)}
+                      disabled={annulationRdvId === rdv.id}
+                    >
+                      <Text style={styles.annulerButtonText}>{annulationRdvId === rdv.id ? 'Annulation...' : 'Annuler ce RDV'}</Text>
+                    </Pressable>
+                  )}
+                </View>
+              ))}
+            </ScrollView>
+          )}
+
+          <Pressable style={({ pressed }) => [styles.secondaryButton, pressed && styles.buttonPressed]} onPress={chargerMesRendezVous}>
+            <Text style={styles.secondaryButtonText}>Actualiser</Text>
+          </Pressable>
+        </>
+      )}
+    </View>
+  );
+
+  const afficherDetailRdv = () => {
+    if (!rdvSelectionne) {
+      return (
+        <View style={styles.card}>
+          <Pressable onPress={() => setEcran('mes_rdv')}>
+            <Text style={styles.backLink}>Retour a Mes RDV</Text>
+          </Pressable>
+          <Text style={styles.infoText}>Rendez-vous introuvable.</Text>
+        </View>
+      );
+    }
+
+    const commentaireAffiche = rdvSelectionne.commentaire || 'Aucune directive pour ce rendez-vous.';
+
+    return (
+      <View style={styles.card}>
+        <Pressable onPress={() => setEcran('mes_rdv')}>
+          <Text style={styles.backLink}>Retour a Mes RDV</Text>
+        </Pressable>
+
+        <Text style={styles.title}>Detail du RDV</Text>
+        <Text style={styles.rdvMetaFort}>Debut : {formaterDateHeure(rdvSelectionne.debut)}</Text>
+        <Text style={styles.rdvMetaFort}>Fin : {formaterDateHeure(rdvSelectionne.fin)}</Text>
+        <Text style={styles.rdvMetaFort}>Medecin : {rdvSelectionne.medecinLibelle || obtenirLibelleMedecin(rdvSelectionne.medecin)}</Text>
+        <Text style={styles.rdvMetaFort}>Etat : {rdvSelectionne.etatLibelle || obtenirLibelleEtat(rdvSelectionne.etat)}</Text>
+
+        <Text style={styles.fieldLabel}>Commentaire / directives</Text>
+        <View style={styles.commentaireContainer}>
+          <Text style={styles.commentaireText}>{commentaireAffiche}</Text>
+        </View>
+      </View>
+    );
+  };
+
   return (
     <SafeAreaView style={styles.container}>
-      {/* Effets decoratifs de fond pour donner plus de profondeur a l'ecran. */}
       <StatusBar style="light" />
       <View style={styles.backgroundCircleTop} />
       <View style={styles.backgroundCircleBottom} />
 
       <View style={styles.content}>
-        {/* Pendant le chargement initial, on attend la verification de session. */}
         {ecran === 'loading' && (
           <View style={styles.loadingCard}>
             <ActivityIndicator size="large" color="#1454F0" />
@@ -417,28 +1284,27 @@ export default function App() {
           </View>
         )}
 
-        {/* Affichage conditionnel des ecrans selon l'etat courant. */}
         {ecran === 'accueil' && afficherAccueil()}
         {ecran === 'login' && afficherConnexion()}
         {ecran === 'menu' && afficherMenu()}
+        {ecran === 'prise_rdv' && afficherPriseRdv()}
+        {ecran === 'mes_rdv' && afficherMesRdv()}
+        {ecran === 'detail_rdv' && afficherDetailRdv()}
       </View>
     </SafeAreaView>
   );
 }
 
 const styles = StyleSheet.create({
-  // Structure globale de la page.
   container: {
     flex: 1,
     backgroundColor: '#EAF0FB',
   },
-  // Zone centrale qui contient la carte active.
   content: {
     flex: 1,
     paddingHorizontal: 20,
     justifyContent: 'center',
   },
-  // Decorations d'arriere-plan.
   backgroundCircleTop: {
     position: 'absolute',
     width: 260,
@@ -457,7 +1323,6 @@ const styles = StyleSheet.create({
     left: -80,
     backgroundColor: '#DCE8FF',
   },
-  // Carte blanche reutilisee pour accueil, connexion et menu.
   card: {
     backgroundColor: '#FFFFFF',
     borderRadius: 24,
@@ -468,7 +1333,6 @@ const styles = StyleSheet.create({
     shadowRadius: 24,
     elevation: 6,
   },
-  // Carte dediee a l'etat de chargement.
   loadingCard: {
     backgroundColor: '#FFFFFF',
     borderRadius: 20,
@@ -481,7 +1345,6 @@ const styles = StyleSheet.create({
     shadowRadius: 20,
     elevation: 4,
   },
-  // Textes principaux de l'interface.
   loadingText: {
     marginTop: 14,
     color: '#415278',
@@ -518,7 +1381,6 @@ const styles = StyleSheet.create({
     fontWeight: '600',
     marginBottom: 14,
   },
-  // Champs du formulaire de connexion.
   input: {
     width: '100%',
     height: 52,
@@ -531,7 +1393,6 @@ const styles = StyleSheet.create({
     fontSize: 16,
     color: '#122446',
   },
-  // Bouton d'action principal.
   primaryButton: {
     width: '100%',
     height: 52,
@@ -541,7 +1402,6 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     marginTop: 4,
   },
-  // Bouton secondaire utilise ici pour la deconnexion.
   secondaryButton: {
     width: '100%',
     height: 50,
@@ -553,7 +1413,6 @@ const styles = StyleSheet.create({
     marginTop: 10,
     backgroundColor: '#F8FAFF',
   },
-  // Etat visuel quand l'utilisateur appuie sur un bouton.
   buttonPressed: {
     opacity: 0.85,
   },
@@ -578,7 +1437,68 @@ const styles = StyleSheet.create({
     fontSize: 14,
     marginBottom: 4,
   },
-  // Grille des actions du menu patient.
+  fieldLabel: {
+    color: '#2E4679',
+    fontSize: 14,
+    fontWeight: '600',
+    marginBottom: 8,
+  },
+  datePickerButton: {
+    width: '100%',
+    minHeight: 52,
+    borderWidth: 1,
+    borderColor: '#CCD7EE',
+    borderRadius: 12,
+    backgroundColor: '#F7F9FF',
+    paddingHorizontal: 16,
+    justifyContent: 'center',
+    marginBottom: 12,
+  },
+  datePickerButtonText: {
+    color: '#122446',
+    fontSize: 16,
+    fontWeight: '600',
+  },
+  calendrierContainer: {
+    marginBottom: 14,
+  },
+  inlineLoader: {
+    marginVertical: 20,
+  },
+  infoText: {
+    color: '#5B6B8F',
+    fontSize: 14,
+  },
+  errorText: {
+    color: '#A52A2A',
+    fontSize: 13,
+    marginTop: 8,
+    marginBottom: 12,
+  },
+  listeMedecins: {
+    marginBottom: 16,
+  },
+  medecinButton: {
+    borderWidth: 1,
+    borderColor: '#CAD8F7',
+    backgroundColor: '#F3F7FF',
+    paddingVertical: 12,
+    paddingHorizontal: 14,
+    borderRadius: 12,
+    marginBottom: 8,
+  },
+  medecinButtonSelectionne: {
+    borderColor: '#1454F0',
+    backgroundColor: '#E6EEFF',
+  },
+  medecinButtonText: {
+    color: '#2A457C',
+    fontSize: 14,
+    fontWeight: '600',
+  },
+  medecinButtonTextSelectionne: {
+    color: '#103DAB',
+  },
   menuGrid: {
     flexDirection: 'row',
     flexWrap: 'wrap',
@@ -586,7 +1506,6 @@ const styles = StyleSheet.create({
     marginTop: 12,
     marginBottom: 6,
   },
-  // Carte individuelle d'une action du menu.
   menuButton: {
     width: '48%',
     backgroundColor: '#EFF4FF',
@@ -602,11 +1521,73 @@ const styles = StyleSheet.create({
   menuButtonPressed: {
     backgroundColor: '#DEE8FF',
   },
-  // Texte affiche dans chaque bouton de menu.
   menuButtonText: {
     color: '#1E3D78',
     fontSize: 15,
     fontWeight: '700',
     textAlign: 'center',
+  },
+  rdvListe: {
+    maxHeight: 300,
+    marginBottom: 12,
+  },
+  rdvListeContenu: {
+    paddingBottom: 6,
+  },
+  rdvCard: {
+    borderWidth: 1,
+    borderColor: '#CAD8F7',
+    backgroundColor: '#F7FAFF',
+    borderRadius: 12,
+    paddingVertical: 12,
+    paddingHorizontal: 12,
+    marginBottom: 10,
+  },
+  rdvDate: {
+    color: '#1A3E81',
+    fontSize: 15,
+    fontWeight: '700',
+    marginBottom: 6,
+  },
+  rdvMeta: {
+    color: '#3B4F7D',
+    fontSize: 13,
+    marginBottom: 4,
+  },
+  rdvMetaFort: {
+    color: '#2C4475',
+    fontSize: 14,
+    fontWeight: '600',
+    marginBottom: 8,
+  },
+  commentaireContainer: {
+    marginTop: 4,
+    borderWidth: 1,
+    borderColor: '#CAD8F7',
+    backgroundColor: '#F7FAFF',
+    borderRadius: 12,
+    paddingVertical: 12,
+    paddingHorizontal: 12,
+  },
+  commentaireText: {
+    color: '#2D3F66',
+    fontSize: 14,
+    lineHeight: 20,
+  },
+  annulerButton: {
+    marginTop: 8,
+    borderWidth: 1,
+    borderColor: '#E7B5B5',
+    backgroundColor: '#FFF1F1',
+    borderRadius: 10,
+    minHeight: 40,
+    justifyContent: 'center',
+    alignItems: 'center',
+    paddingHorizontal: 10,
+  },
+  annulerButtonText: {
+    color: '#A52A2A',
+    fontSize: 14,
+    fontWeight: '700',
   },
 });
