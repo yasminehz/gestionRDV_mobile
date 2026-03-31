@@ -253,6 +253,15 @@ const normaliserTexte = (valeur) =>
     .normalize('NFD')
     .replace(/[\u0300-\u036f]/g, '');
 
+const NOMS_MEDECINS_EXCLUS = ['test test', 'shane hollander'];
+
+const estNomMedecinExclu = (nomMedecin) => {
+  const nomNormalise = normaliserTexte(nomMedecin).replace(/\s+/g, ' ').trim();
+  return NOMS_MEDECINS_EXCLUS.some((nomExclu) => nomNormalise === normaliserTexte(nomExclu));
+};
+
+const estMedecinExclu = (medecin) => estNomMedecinExclu(formatNomMedecin(medecin));
+
 const obtenirLibelleMedecin = (medecinValeur, medecinsParIri = {}) => {
   if (typeof medecinValeur === 'string' && medecinsParIri[medecinValeur]) {
     return medecinsParIri[medecinValeur];
@@ -290,6 +299,20 @@ const obtenirLibelleEtat = (etatValeur, etatsParIri = {}) => {
   return 'Non defini';
 };
 
+const obtenirCommentaireRdv = (rdv) => {
+  const champsPossibles = [
+    rdv?.commentaire,
+    rdv?.commentaires,
+    rdv?.instructions,
+    rdv?.note,
+    rdv?.notes,
+    rdv?.motif,
+  ];
+
+  const valeur = champsPossibles.find((champ) => typeof champ === 'string' && champ.trim().length > 0);
+  return valeur ? valeur.trim() : '';
+};
+
 const obtenirPrioriteEtat = (etatLibelle) => {
   const etatNormalise = normaliserTexte(etatLibelle);
 
@@ -316,20 +339,17 @@ const obtenirPrioriteEtat = (etatLibelle) => {
   return 99;
 };
 
-const extraireCommentaireRdv = (rdv) => {
-  const commentaireBrut =
-    rdv?.commentaire ||
-    rdv?.comment ||
-    rdv?.directive ||
-    rdv?.directives ||
-    rdv?.consigne ||
-    rdv?.consignes ||
-    rdv?.note ||
-    rdv?.notes ||
-    '';
+const estRdvAnnulable = (rdv) => {
+  const etatNormalise = normaliserTexte(rdv?.etatLibelle || '');
 
-  return String(commentaireBrut || '').trim();
+  if (!rdv?.id) {
+    return false;
+  }
+
+  return !etatNormalise.includes('annule') && !etatNormalise.includes('refuse') && !etatNormalise.includes('realise');
 };
+
+const estRdvAnnule = (rdv) => normaliserTexte(rdv?.etatLibelle || '').includes('annule');
 
 const obtenirNomAffiche = (utilisateur) => {
   const nomComplet = `${utilisateur?.nom || ''} ${utilisateur?.prenom || ''}`.trim();
@@ -356,10 +376,11 @@ export default function App() {
   const [mesRendezVous, setMesRendezVous] = useState([]);
   const [chargementMesRdv, setChargementMesRdv] = useState(false);
   const [erreurMesRdv, setErreurMesRdv] = useState('');
-  const [rdvSelectionne, setRdvSelectionne] = useState(null);
-  const [annulationRdvId, setAnnulationRdvId] = useState(null);
   const [patientIri, setPatientIri] = useState('');
   const [etatEnAttenteIri, setEtatEnAttenteIri] = useState('/api/etats/1');
+  const [etatAnnuleIri, setEtatAnnuleIri] = useState('/api/etats/4');
+  const [rdvDetailSelectionneId, setRdvDetailSelectionneId] = useState(null);
+  const [annulationRdvIdEnCours, setAnnulationRdvIdEnCours] = useState(null);
 
   useEffect(() => {
     const restaurerSession = async () => {
@@ -395,6 +416,12 @@ export default function App() {
 
   useEffect(() => {
     if (ecran === 'mes_rdv' && utilisateurConnecte?.jeton) {
+      chargerMesRendezVous();
+    }
+  }, [ecran, utilisateurConnecte?.jeton]);
+
+  useEffect(() => {
+    if (ecran === 'annuler_rdv' && utilisateurConnecte?.jeton) {
       chargerMesRendezVous();
     }
   }, [ecran, utilisateurConnecte?.jeton]);
@@ -449,7 +476,7 @@ export default function App() {
           iri: medecin?.['@id'] || `/api/medecins/${medecin?.id}`,
           nomAffiche: formatNomMedecin(medecin),
         }))
-        .filter((medecin) => medecin?.id && medecin?.iri);
+        .filter((medecin) => medecin?.id && medecin?.iri && !estNomMedecinExclu(medecin.nomAffiche));
 
       setMedecinsDisponibles(medecins);
       setMedecinSelectionne((precedent) => {
@@ -508,9 +535,14 @@ export default function App() {
       if (reponseEtats.ok) {
         const etats = extraireCollection(donneesEtats);
         const etatEnAttente = etats.find((etat) => String(etat?.libelle || '').toLowerCase().includes('attente'));
+        const etatAnnule = etats.find((etat) => String(etat?.libelle || '').toLowerCase().includes('annule'));
 
         if (etatEnAttente) {
           setEtatEnAttenteIri(etatEnAttente?.['@id'] || `/api/etats/${etatEnAttente?.id}`);
+        }
+
+        if (etatAnnule) {
+          setEtatAnnuleIri(etatAnnule?.['@id'] || `/api/etats/${etatAnnule?.id}`);
         }
       }
     } catch (erreur) {
@@ -594,9 +626,17 @@ export default function App() {
       }
 
       const medecinsParIri = {};
+      const irisMedecinsExclus = new Set();
       if (reponseMedecins.ok) {
         extraireCollection(donneesMedecins).forEach((medecin) => {
           const iri = medecin?.['@id'] || (medecin?.id ? `/api/medecins/${medecin.id}` : '');
+          if (estMedecinExclu(medecin)) {
+            if (iri) {
+              irisMedecinsExclus.add(iri);
+            }
+            return;
+          }
+
           if (iri) {
             medecinsParIri[iri] = formatNomMedecin(medecin);
           }
@@ -611,19 +651,33 @@ export default function App() {
             etatsParIri[iri] = etat?.libelle || `Etat #${etat?.id}`;
           }
         });
+
+        const etatAnnule = extraireCollection(donneesEtats).find((etat) =>
+          String(etat?.libelle || '').toLowerCase().includes('annule')
+        );
+
+        if (etatAnnule) {
+          setEtatAnnuleIri(etatAnnule?.['@id'] || `/api/etats/${etatAnnule?.id}`);
+        }
       }
 
-      const rendezVous = extraireCollection(donnees).map((rdv) => ({
-        id: rdv?.id,
-        iri: rdv?.['@id'] || (rdv?.id ? `/api/rendez_vouses/${rdv.id}` : ''),
-        debut: rdv?.debut,
-        fin: rdv?.fin,
-        medecin: rdv?.medecin,
-        etat: rdv?.etat,
-        medecinLibelle: obtenirLibelleMedecin(rdv?.medecin, medecinsParIri),
-        etatLibelle: obtenirLibelleEtat(rdv?.etat, etatsParIri),
-        commentaire: extraireCommentaireRdv(rdv),
-      }));
+      const rendezVous = extraireCollection(donnees)
+        .map((rdv) => ({
+          id: rdv?.id,
+          debut: rdv?.debut,
+          fin: rdv?.fin,
+          medecin: rdv?.medecin,
+          etat: rdv?.etat,
+          medecinLibelle: obtenirLibelleMedecin(rdv?.medecin, medecinsParIri),
+          etatLibelle: obtenirLibelleEtat(rdv?.etat, etatsParIri),
+          commentaireAffiche: obtenirCommentaireRdv(rdv),
+        }))
+        .filter(
+          (rdv) =>
+            !estNomMedecinExclu(rdv.medecinLibelle) &&
+            !(typeof rdv.medecin === 'string' && irisMedecinsExclus.has(rdv.medecin)) &&
+            !estRdvAnnule(rdv)
+        );
 
       rendezVous.sort((a, b) => {
         const prioriteA = obtenirPrioriteEtat(a.etatLibelle);
@@ -643,90 +697,6 @@ export default function App() {
       console.error('Erreur chargerMesRendezVous:', erreur);
     } finally {
       setChargementMesRdv(false);
-    }
-  };
-
-  const estEtatAnnulable = (etatLibelle) => {
-    const etatNormalise = normaliserTexte(etatLibelle);
-    return !(etatNormalise.includes('annule') || etatNormalise.includes('refuse') || etatNormalise.includes('realise'));
-  };
-
-  const annulerRendezVous = async (rdv) => {
-    if (!rdv?.id) {
-      Alert.alert('Erreur', 'Rendez-vous invalide.');
-      return;
-    }
-
-    if (!estEtatAnnulable(rdv?.etatLibelle || obtenirLibelleEtat(rdv?.etat))) {
-      Alert.alert('Information', 'Ce rendez-vous ne peut plus etre annule.');
-      return;
-    }
-
-    setAnnulationRdvId(rdv.id);
-
-    try {
-      const reponseEtats = await fetch(`${URL_API_BASE}/etats`, {
-        headers: obtenirHeadersAuth(),
-      });
-
-      const donneesEtats = await parserDonneesReponse(reponseEtats);
-
-      if (!reponseEtats.ok) {
-        Alert.alert('Erreur', 'Impossible de charger les etats.');
-        return;
-      }
-
-      const etatAnnule = extraireCollection(donneesEtats).find(
-        (etat) => normaliserTexte(etat?.libelle).includes('annule')
-      );
-
-      const iriEtatAnnule = etatAnnule?.['@id'] || (etatAnnule?.id ? `/api/etats/${etatAnnule.id}` : '');
-
-      if (!iriEtatAnnule) {
-        Alert.alert('Erreur', 'Etat annule introuvable.');
-        return;
-      }
-
-      const iriRdv = rdv?.iri || `/api/rendez_vouses/${rdv.id}`;
-
-      const reponse = await fetch(`${URL_API_BASE}/rendez_vouses/${rdv.id}`, {
-        method: 'PATCH',
-        headers: {
-          ...obtenirHeadersAuth('application/merge-patch+json'),
-          Accept: 'application/ld+json',
-        },
-        body: JSON.stringify({
-          etat: iriEtatAnnule,
-        }),
-      });
-
-      const donnees = await parserDonneesReponse(reponse);
-
-      if (!reponse.ok) {
-        Alert.alert('Erreur', donnees?.detail || donnees?.message || 'Annulation impossible.');
-        return;
-      }
-
-      setMesRendezVous((precedent) =>
-        precedent.map((item) =>
-          item.id === rdv.id
-            ? {
-                ...item,
-                etat: iriEtatAnnule,
-                etatLibelle: etatAnnule?.libelle || 'annule',
-                iri: item?.iri || iriRdv,
-              }
-            : item
-        )
-      );
-
-      Alert.alert('Succes', 'Le rendez-vous a bien ete annule.');
-      await chargerMesRendezVous();
-    } catch (erreur) {
-      Alert.alert('Erreur', 'Impossible d\'annuler ce rendez-vous.');
-      console.error('Erreur annulerRendezVous:', erreur);
-    } finally {
-      setAnnulationRdvId(null);
     }
   };
 
@@ -890,6 +860,67 @@ export default function App() {
     }
   };
 
+  const basculerDetailsRdv = (rdvId) => {
+    setRdvDetailSelectionneId((precedent) => (precedent === rdvId ? null : rdvId));
+  };
+
+  const executerAnnulationRendezVous = async (rdv) => {
+    setAnnulationRdvIdEnCours(rdv?.id || null);
+
+    try {
+      const reponseSuppression = await fetch(`${URL_API_BASE}/rendez_vouses/${rdv?.id}`, {
+        method: 'DELETE',
+        headers: obtenirHeadersAuth(),
+      });
+
+      const donneesSuppression = await parserDonneesReponse(reponseSuppression);
+      const suppressionOk = reponseSuppression.ok || reponseSuppression.status === 204;
+
+      if (!suppressionOk) {
+        const reponsePatch = await fetch(`${URL_API_BASE}/rendez_vouses/${rdv?.id}`, {
+          method: 'PATCH',
+          headers: obtenirHeadersAuth('application/merge-patch+json'),
+          body: JSON.stringify({
+            etat: etatAnnuleIri,
+          }),
+        });
+
+        const donneesPatch = await parserDonneesReponse(reponsePatch);
+        const patchOk = reponsePatch.ok || reponsePatch.status === 200;
+
+        if (!patchOk) {
+          Alert.alert('Erreur', donneesPatch?.detail || donneesPatch?.message || donneesSuppression?.detail || 'Annulation impossible.');
+          return;
+        }
+      }
+
+      Alert.alert('Succes', 'Le rendez-vous a ete annule.');
+      setRdvDetailSelectionneId(null);
+      setMesRendezVous((precedent) => precedent.filter((item) => item?.id !== rdv?.id));
+    } catch (erreur) {
+      Alert.alert('Erreur', 'Impossible d annuler le rendez-vous pour le moment.');
+      console.error('Erreur annulerRendezVous:', erreur);
+    } finally {
+      setAnnulationRdvIdEnCours(null);
+    }
+  };
+
+  const annulerRendezVous = (rdv) => {
+    Alert.alert('Confirmation', 'Voulez-vous annuler ce rendez-vous ?', [
+      {
+        text: 'Non',
+        style: 'cancel',
+      },
+      {
+        text: 'Oui, annuler',
+        style: 'destructive',
+        onPress: () => {
+          void executerAnnulationRendezVous(rdv);
+        },
+      },
+    ]);
+  };
+
   const validerConnexion = async () => {
     if (!courriel || !motDePasse) {
       Alert.alert('Erreur', 'Veuillez remplir tous les champs');
@@ -955,13 +986,14 @@ export default function App() {
       setCreneauxDisponibles([]);
       setMesRendezVous([]);
       setErreurMesRdv('');
-      setRdvSelectionne(null);
-      setAnnulationRdvId(null);
       setMedecinsDisponibles([]);
       setMedecinSelectionne(null);
       setErreurChargementMedecins('');
       setPatientIri('');
       setEtatEnAttenteIri('/api/etats/1');
+      setEtatAnnuleIri('/api/etats/4');
+      setRdvDetailSelectionneId(null);
+      setAnnulationRdvIdEnCours(null);
       setEcran('accueil');
     } catch (erreur) {
       Alert.alert('Erreur', 'Impossible de fermer la session');
@@ -979,12 +1011,17 @@ export default function App() {
       return;
     }
 
-    Alert.alert(libelle, 'Fonctionnalite patient prete a connecter.');
-  };
+    if (libelle === 'Annuler un RDV') {
+      setEcran('annuler_rdv');
+      return;
+    }
 
-  const ouvrirDetailRdv = (rdv) => {
-    setRdvSelectionne(rdv);
-    setEcran('detail_rdv');
+    if (libelle === 'Afficher un RDV') {
+      setEcran('mes_rdv');
+      return;
+    }
+
+    Alert.alert(libelle, 'Fonctionnalite patient prete a connecter.');
   };
 
   const gererChangementDate = (evenement, nouvelleDate) => {
@@ -1066,8 +1103,12 @@ export default function App() {
           <Text style={styles.menuButtonText}>Mes RDV</Text>
         </Pressable>
 
-        <Pressable style={({ pressed }) => [styles.menuButton, pressed && styles.menuButtonPressed]} onPress={() => gererActionMenu('Mon profil')}>
-          <Text style={styles.menuButtonText}>Mon profil</Text>
+        <Pressable style={({ pressed }) => [styles.menuButton, pressed && styles.menuButtonPressed]} onPress={() => gererActionMenu('Annuler un RDV')}>
+          <Text style={styles.menuButtonText}>Annuler un RDV</Text>
+        </Pressable>
+
+        <Pressable style={({ pressed }) => [styles.menuButton, pressed && styles.menuButtonPressed]} onPress={() => gererActionMenu('Afficher un RDV')}>
+          <Text style={styles.menuButtonText}>Afficher un RDV</Text>
         </Pressable>
       </View>
 
@@ -1078,7 +1119,7 @@ export default function App() {
   );
 
   const afficherPriseRdv = () => (
-    <View style={styles.card}>
+    <ScrollView style={styles.card} contentContainerStyle={styles.priseRdvContenu}>
       <Pressable onPress={() => setEcran('menu')}>
         <Text style={styles.backLink}>Retour au menu</Text>
       </Pressable>
@@ -1181,7 +1222,7 @@ export default function App() {
           )}
         </>
       )}
-    </View>
+    </ScrollView>
   );
 
   const afficherMesRdv = () => (
@@ -1210,18 +1251,20 @@ export default function App() {
                   <Text style={styles.rdvMeta}>Medecin : {rdv.medecinLibelle || obtenirLibelleMedecin(rdv.medecin)}</Text>
                   <Text style={styles.rdvMeta}>Etat : {rdv.etatLibelle || obtenirLibelleEtat(rdv.etat)}</Text>
 
-                  <Pressable style={({ pressed }) => [styles.secondaryButton, pressed && styles.buttonPressed]} onPress={() => ouvrirDetailRdv(rdv)}>
-                    <Text style={styles.secondaryButtonText}>Afficher le RDV</Text>
+                  <Pressable
+                    style={({ pressed }) => [styles.secondaryButtonCompact, pressed && styles.buttonPressed]}
+                    onPress={() => basculerDetailsRdv(rdv.id)}
+                  >
+                    <Text style={styles.secondaryButtonCompactText}>
+                      {rdvDetailSelectionneId === rdv.id ? 'Masquer details' : 'Voir details'}
+                    </Text>
                   </Pressable>
 
-                  {estEtatAnnulable(rdv.etatLibelle || obtenirLibelleEtat(rdv.etat)) && (
-                    <Pressable
-                      style={({ pressed }) => [styles.annulerButton, (pressed || annulationRdvId === rdv.id) && styles.buttonPressed]}
-                      onPress={() => annulerRendezVous(rdv)}
-                      disabled={annulationRdvId === rdv.id}
-                    >
-                      <Text style={styles.annulerButtonText}>{annulationRdvId === rdv.id ? 'Annulation...' : 'Annuler ce RDV'}</Text>
-                    </Pressable>
+                  {rdvDetailSelectionneId === rdv.id && (
+                    <View style={styles.rdvDetailsBloc}>
+                      <Text style={styles.rdvDetailTitre}>Commentaire / directives</Text>
+                      <Text style={styles.rdvDetailTexte}>{rdv.commentaireAffiche || 'Aucun commentaire fourni.'}</Text>
+                    </View>
                   )}
                 </View>
               ))}
@@ -1236,36 +1279,75 @@ export default function App() {
     </View>
   );
 
-  const afficherDetailRdv = () => {
-    if (!rdvSelectionne) {
-      return (
-        <View style={styles.card}>
-          <Pressable onPress={() => setEcran('mes_rdv')}>
-            <Text style={styles.backLink}>Retour a Mes RDV</Text>
-          </Pressable>
-          <Text style={styles.infoText}>Rendez-vous introuvable.</Text>
-        </View>
-      );
-    }
-
-    const commentaireAffiche = rdvSelectionne.commentaire || 'Aucune directive pour ce rendez-vous.';
+  const afficherAnnulerRdv = () => {
+    const rendezVousAnnulables = mesRendezVous.filter(estRdvAnnulable);
 
     return (
       <View style={styles.card}>
-        <Pressable onPress={() => setEcran('mes_rdv')}>
-          <Text style={styles.backLink}>Retour a Mes RDV</Text>
+        <Pressable onPress={() => setEcran('menu')}>
+          <Text style={styles.backLink}>Retour au menu</Text>
         </Pressable>
 
-        <Text style={styles.title}>Detail du RDV</Text>
-        <Text style={styles.rdvMetaFort}>Debut : {formaterDateHeure(rdvSelectionne.debut)}</Text>
-        <Text style={styles.rdvMetaFort}>Fin : {formaterDateHeure(rdvSelectionne.fin)}</Text>
-        <Text style={styles.rdvMetaFort}>Medecin : {rdvSelectionne.medecinLibelle || obtenirLibelleMedecin(rdvSelectionne.medecin)}</Text>
-        <Text style={styles.rdvMetaFort}>Etat : {rdvSelectionne.etatLibelle || obtenirLibelleEtat(rdvSelectionne.etat)}</Text>
+        <Text style={styles.title}>Annuler un RDV</Text>
+        <Text style={styles.subtitle}>Selectionnez un rendez-vous puis confirmez l annulation.</Text>
 
-        <Text style={styles.fieldLabel}>Commentaire / directives</Text>
-        <View style={styles.commentaireContainer}>
-          <Text style={styles.commentaireText}>{commentaireAffiche}</Text>
-        </View>
+        {chargementMesRdv ? (
+          <ActivityIndicator size="small" color="#1454F0" style={styles.inlineLoader} />
+        ) : (
+          <>
+            {!!erreurMesRdv && <Text style={styles.errorText}>{erreurMesRdv}</Text>}
+
+            {!erreurMesRdv && rendezVousAnnulables.length === 0 && (
+              <Text style={styles.infoText}>Aucun rendez-vous annulable pour le moment.</Text>
+            )}
+
+            {rendezVousAnnulables.length > 0 && (
+              <ScrollView style={styles.rdvListe} contentContainerStyle={styles.rdvListeContenu}>
+                {rendezVousAnnulables.map((rdv) => (
+                  <View key={String(rdv.id || `${rdv.debut}-${rdv.fin}`)} style={styles.rdvCard}>
+                    <Text style={styles.rdvDate}>{formaterDateHeure(rdv.debut)}</Text>
+                    <Text style={styles.rdvMeta}>Fin : {formaterDateHeure(rdv.fin)}</Text>
+                    <Text style={styles.rdvMeta}>Medecin : {rdv.medecinLibelle || obtenirLibelleMedecin(rdv.medecin)}</Text>
+                    <Text style={styles.rdvMeta}>Etat : {rdv.etatLibelle || obtenirLibelleEtat(rdv.etat)}</Text>
+
+                    <Pressable
+                      style={({ pressed }) => [styles.secondaryButtonCompact, pressed && styles.buttonPressed]}
+                      onPress={() => basculerDetailsRdv(rdv.id)}
+                    >
+                      <Text style={styles.secondaryButtonCompactText}>
+                        {rdvDetailSelectionneId === rdv.id ? 'Masquer details' : 'Voir details'}
+                      </Text>
+                    </Pressable>
+
+                    {rdvDetailSelectionneId === rdv.id && (
+                      <View style={styles.rdvDetailsBloc}>
+                        <Text style={styles.rdvDetailTitre}>Commentaire / directives</Text>
+                        <Text style={styles.rdvDetailTexte}>{rdv.commentaireAffiche || 'Aucun commentaire fourni.'}</Text>
+                      </View>
+                    )}
+
+                    <Pressable
+                      style={({ pressed }) => [
+                        styles.dangerButton,
+                        (pressed || annulationRdvIdEnCours === rdv.id) && styles.buttonPressed,
+                      ]}
+                      onPress={() => annulerRendezVous(rdv)}
+                      disabled={annulationRdvIdEnCours === rdv.id}
+                    >
+                      <Text style={styles.dangerButtonText}>
+                        {annulationRdvIdEnCours === rdv.id ? 'Annulation...' : 'Annuler ce RDV'}
+                      </Text>
+                    </Pressable>
+                  </View>
+                ))}
+              </ScrollView>
+            )}
+
+            <Pressable style={({ pressed }) => [styles.secondaryButton, pressed && styles.buttonPressed]} onPress={chargerMesRendezVous}>
+              <Text style={styles.secondaryButtonText}>Actualiser</Text>
+            </Pressable>
+          </>
+        )}
       </View>
     );
   };
@@ -1289,7 +1371,7 @@ export default function App() {
         {ecran === 'menu' && afficherMenu()}
         {ecran === 'prise_rdv' && afficherPriseRdv()}
         {ecran === 'mes_rdv' && afficherMesRdv()}
-        {ecran === 'detail_rdv' && afficherDetailRdv()}
+        {ecran === 'annuler_rdv' && afficherAnnulerRdv()}
       </View>
     </SafeAreaView>
   );
@@ -1527,6 +1609,9 @@ const styles = StyleSheet.create({
     fontWeight: '700',
     textAlign: 'center',
   },
+  priseRdvContenu: {
+    paddingBottom: 20,
+  },
   rdvListe: {
     maxHeight: 300,
     marginBottom: 12,
@@ -1554,39 +1639,52 @@ const styles = StyleSheet.create({
     fontSize: 13,
     marginBottom: 4,
   },
-  rdvMetaFort: {
-    color: '#2C4475',
-    fontSize: 14,
-    fontWeight: '600',
-    marginBottom: 8,
-  },
-  commentaireContainer: {
-    marginTop: 4,
-    borderWidth: 1,
-    borderColor: '#CAD8F7',
-    backgroundColor: '#F7FAFF',
-    borderRadius: 12,
-    paddingVertical: 12,
-    paddingHorizontal: 12,
-  },
-  commentaireText: {
-    color: '#2D3F66',
-    fontSize: 14,
-    lineHeight: 20,
-  },
-  annulerButton: {
+  secondaryButtonCompact: {
     marginTop: 8,
     borderWidth: 1,
-    borderColor: '#E7B5B5',
-    backgroundColor: '#FFF1F1',
+    borderColor: '#CAD5ED',
     borderRadius: 10,
-    minHeight: 40,
-    justifyContent: 'center',
-    alignItems: 'center',
+    paddingVertical: 8,
+    paddingHorizontal: 10,
+    alignSelf: 'flex-start',
+    backgroundColor: '#F8FAFF',
+  },
+  secondaryButtonCompactText: {
+    color: '#23407A',
+    fontSize: 13,
+    fontWeight: '700',
+  },
+  rdvDetailsBloc: {
+    marginTop: 10,
+    borderWidth: 1,
+    borderColor: '#D8E3FA',
+    borderRadius: 10,
+    backgroundColor: '#FFFFFF',
+    paddingVertical: 8,
     paddingHorizontal: 10,
   },
-  annulerButtonText: {
-    color: '#A52A2A',
+  rdvDetailTitre: {
+    color: '#254179',
+    fontSize: 12,
+    fontWeight: '700',
+    marginBottom: 4,
+  },
+  rdvDetailTexte: {
+    color: '#3B4F7D',
+    fontSize: 13,
+    lineHeight: 18,
+  },
+  dangerButton: {
+    width: '100%',
+    minHeight: 44,
+    marginTop: 10,
+    borderRadius: 10,
+    backgroundColor: '#B33636',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  dangerButtonText: {
+    color: '#FFFFFF',
     fontSize: 14,
     fontWeight: '700',
   },
